@@ -7,6 +7,8 @@ from html import escape
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CommandHandler, CallbackContext, MessageHandler, filters, Application
 from telegram.error import BadRequest
+from pymongo.errors import DuplicateKeyError
+from datetime import datetime
 
 from shivu import db, shivuu, application, LOGGER
 from shivu.modules import ALL_MODULES
@@ -86,6 +88,175 @@ if hasattr(pymongo_collection.Collection, 'ensure_index'):
     
     pymongo_collection.Collection.ensure_index = _safe_ensure_index
 
+# ==================== MIGRATION FUNCTIONS ====================
+
+async def migrate_user_data():
+    """Migrate user data from old collection to new collection with unique index"""
+    
+    # Define collection names
+    OLD_COLLECTION_NAME = 'user_collection_lmaoooo'
+    NEW_COLLECTION_NAME = 'users'
+    
+    # Get collections
+    old_collection = db[OLD_COLLECTION_NAME]
+    new_collection = db[NEW_COLLECTION_NAME]
+    
+    # Check if migration has already been done
+    migration_check = await db.migration_metadata.find_one({'migration': 'user_collection_migration'})
+    if migration_check and migration_check.get('completed'):
+        LOGGER.info("✅ User data migration already completed")
+        return True
+    
+    LOGGER.info("🔄 Starting user data migration...")
+    
+    try:
+        # Create unique index on new collection (this will be safe due to our patch)
+        await new_collection.create_index([('id', 1)], unique=True, name='unique_user_id')
+        LOGGER.info("✅ Created unique index on 'id' field in new collection")
+        
+        # Get all documents from old collection
+        total_docs = await old_collection.count_documents({})
+        LOGGER.info(f"📊 Found {total_docs} documents in old collection")
+        
+        # Track migration stats
+        migrated_count = 0
+        duplicate_count = 0
+        error_count = 0
+        
+        # Use aggregation to group by 'id' and get the first document for each user
+        pipeline = [
+            {
+                '$sort': {'_id': 1}  # Sort by MongoDB _id to get oldest first
+            },
+            {
+                '$group': {
+                    '_id': '$id',
+                    'doc': {'$first': '$$ROOT'}
+                }
+            }
+        ]
+        
+        # Process unique documents
+        async for group in old_collection.aggregate(pipeline):
+            try:
+                user_doc = group['doc']
+                
+                # Remove the _id field to let MongoDB generate a new one
+                user_doc.pop('_id', None)
+                
+                # Insert into new collection
+                await new_collection.insert_one(user_doc)
+                migrated_count += 1
+                
+                if migrated_count % 100 == 0:
+                    LOGGER.info(f"📈 Migrated {migrated_count}/{total_docs} users...")
+                    
+            except DuplicateKeyError:
+                # This shouldn't happen due to aggregation grouping, but just in case
+                duplicate_count += 1
+                LOGGER.debug(f"⚠️ Skipped duplicate user_id: {group['_id']}")
+            except Exception as e:
+                error_count += 1
+                LOGGER.error(f"❌ Error migrating user {group['_id']}: {e}")
+        
+        # Update migration metadata
+        await db.migration_metadata.update_one(
+            {'migration': 'user_collection_migration'},
+            {
+                '$set': {
+                    'completed': True,
+                    'migrated_count': migrated_count,
+                    'duplicate_count': duplicate_count,
+                    'error_count': error_count,
+                    'migrated_at': datetime.utcnow(),
+                    'source_collection': OLD_COLLECTION_NAME,
+                    'target_collection': NEW_COLLECTION_NAME
+                }
+            },
+            upsert=True
+        )
+        
+        LOGGER.info(f"""
+✅ Migration completed!
+   Total migrated: {migrated_count}
+   Duplicates skipped: {duplicate_count}
+   Errors: {error_count}
+        """)
+        
+        return True
+        
+    except Exception as e:
+        LOGGER.error(f"❌ Migration failed: {e}")
+        LOGGER.error(traceback.format_exc())
+        return False
+
+async def verify_migration():
+    """Verify that migration was successful"""
+    old_collection = db['user_collection_lmaoooo']
+    new_collection = db['users']
+    
+    # Count unique users in old collection
+    pipeline = [
+        {'$group': {'_id': '$id'}},
+        {'$count': 'unique_users'}
+    ]
+    
+    old_unique_count = 0
+    async for result in old_collection.aggregate(pipeline):
+        old_unique_count = result['unique_users']
+    
+    # Count users in new collection
+    new_count = await new_collection.count_documents({})
+    
+    LOGGER.info(f"""
+🔍 Migration Verification:
+   Unique users in old collection: {old_unique_count}
+   Users in new collection: {new_count}
+   Match: {old_unique_count == new_count}
+    """)
+    
+    # Check for duplicate ids in new collection
+    duplicate_check = await new_collection.aggregate([
+        {'$group': {'_id': '$id', 'count': {'$sum': 1}}},
+        {'$match': {'count': {'$gt': 1}}},
+        {'$count': 'duplicates'}
+    ]).to_list(length=1)
+    
+    duplicates = duplicate_check[0]['duplicates'] if duplicate_check else 0
+    LOGGER.info(f"   Duplicate IDs in new collection: {duplicates}")
+    
+    return old_unique_count == new_count and duplicates == 0
+
+async def cleanup_old_collection():
+    """Safely remove old collection after verification"""
+    migration_check = await db.migration_metadata.find_one({
+        'migration': 'user_collection_migration',
+        'completed': True
+    })
+    
+    if not migration_check:
+        LOGGER.warning("⚠️ Cannot cleanup - migration not completed")
+        return False
+    
+    # Verify migration first
+    verification_ok = await verify_migration()
+    
+    if verification_ok:
+        LOGGER.info("✅ Migration verified successfully")
+        
+        # Optional: Backup old collection before deletion
+        backup_name = f"user_collection_lmaoooo_backup_{datetime.utcnow().strftime('%Y%m%d')}"
+        await db.command({
+            'renameCollection': f"{db.name}.user_collection_lmaoooo",
+            'to': f"{db.name}.{backup_name}"
+        })
+        
+        LOGGER.info(f"📦 Old collection backed up as: {backup_name}")
+        return True
+    else:
+        LOGGER.error("❌ Migration verification failed - not cleaning up")
+        return False
+
 # ==================== BOT CONFIGURATION ====================
 
 # Small caps conversion function
@@ -119,7 +290,7 @@ def to_small_caps(text):
 
 # Database collections
 collection = db['anime_characters_lol']
-user_collection = db['user_collection_lmaoooo']
+user_collection = db['users']  # CHANGED: Now using new collection
 user_totals_collection = db['user_totals_lmaoooo']
 group_user_totals_collection = db['group_user_totalsssssss']
 top_global_groups_collection = db['top_global_groups']
@@ -736,6 +907,22 @@ async def guess(update: Update, context: CallbackContext) -> None:
 async def main():
     """Main async entry point - single event loop for everything"""
     try:
+        # 0. Run user data migration
+        LOGGER.info("🔄 Checking user data migration...")
+        migration_success = await migrate_user_data()
+        if not migration_success:
+            LOGGER.warning("⚠️ User data migration failed or skipped")
+        
+        # Optional: Verify migration
+        if migration_success:
+            verification_ok = await verify_migration()
+            if verification_ok:
+                LOGGER.info("✅ Migration verified successfully")
+                # Optional: Uncomment to auto-cleanup
+                # await cleanup_old_collection()
+            else:
+                LOGGER.warning("⚠️ Migration verification failed")
+        
         # 1. Load rarity system
         try:
             from shivu.modules.rarity import (
