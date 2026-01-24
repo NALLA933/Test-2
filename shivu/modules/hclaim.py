@@ -15,11 +15,12 @@ from telegram.ext import CommandHandler, CallbackContext
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, RetryAfter, TimedOut
 from cachetools import TTLCache, LRUCache
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 import io
 from concurrent.futures import ThreadPoolExecutor
+import aiohttp
 
 from shivu import application, user_collection, collection, sudo_users
 
@@ -246,7 +247,7 @@ class PitySystem:
     
     @staticmethod
     def get_pity_progress(user_id: int) -> Tuple[int, int]:
-        return pity_counter[user_id], CONFIG.PITY_SYSTEM_THRESHOLD
+        return pity_counter.get(user_id, 0), CONFIG.PITY_SYSTEM_THRESHOLD
     
     @staticmethod
     def reset_pity(user_id: int):
@@ -288,14 +289,14 @@ class LuckSystem:
 
 class ImageProcessor:
     @staticmethod
-    async def create_claim_card(character: Dict, user_name: str, streak: int, rarity: RarityType) -> io.BytesIO:
+    async def create_claim_card(character: Dict, user_name: str, user_id: int, streak: int, rarity: RarityType) -> io.BytesIO:
         return await asyncio.get_event_loop().run_in_executor(
-            executor, ImageProcessor._generate_card, character, user_name, streak, rarity
+            executor, ImageProcessor._generate_card, character, user_name, user_id, streak, rarity
         )
     
     @staticmethod
-    def _generate_card(character: Dict, user_name: str, streak: int, rarity: RarityType) -> io.BytesIO:
-        cache_key = f"{character['id']}_{streak}_{user_name}_{rarity.key}"
+    def _generate_card(character: Dict, user_name: str, user_id: int, streak: int, rarity: RarityType) -> io.BytesIO:
+        cache_key = f"{character['id']}_{user_id}_{streak}_{rarity.key}"
         if cache_key in image_cache:
             return image_cache[cache_key]
         
@@ -384,10 +385,11 @@ class ImageProcessor:
                  fill='white', font=text_font, anchor='mm', stroke_width=2, stroke_fill='#000000')
         
         multiplier = min(streak, 10) * 0.5 + 1
+        pity_count = pity_counter.get(user_id, 0)
         stats_y = 380
         stats = [
             f"⚡ Multiplier: {multiplier:.1f}x",
-            f"🎯 Pity: {pity_counter.get(hash(user_name), 0)}/{CONFIG.PITY_SYSTEM_THRESHOLD}",
+            f"🎯 Pity: {pity_count}/{CONFIG.PITY_SYSTEM_THRESHOLD}",
             f"🏆 ID: {character['id']}"
         ]
         
@@ -435,8 +437,12 @@ class ImageProcessor:
 
 class CharacterManager:
     @staticmethod
-    @retry(stop=stop_after_attempt(CONFIG.MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10),
-           retry=retry_if_exception_type(Exception))
+    @retry(
+        stop=stop_after_attempt(CONFIG.MAX_RETRIES),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((TimeoutError, RetryAfter, TimedOut, aiohttp.ClientError, asyncio.TimeoutError)),
+        reraise=True
+    )
     async def fetch_character(user_id: int, target_rarity: Optional[str] = None, luck_factor: float = 1.0) -> Tuple[Optional[Dict], RarityType, bool, bool]:
         try:
             user_data = await CacheManager.get_user_data(user_id)
@@ -467,39 +473,47 @@ class CharacterManager:
             else:
                 selected_rarity = CharacterManager._select_rarity(luck_factor)
             
-            cache_key = CacheManager.generate_cache_key(
-                'char', user_id, selected_rarity.key, len(claimed_ids), int(luck_factor * 100)
-            )
+            # Define fallback order
+            fallback_order = []
+            if selected_rarity:
+                fallback_order.append(selected_rarity)
+            fallback_order.extend([RarityType.LEGENDARY, RarityType.RARE, RarityType.COMMON])
             
-            if cache_key in character_cache:
-                cached_char = character_cache[cache_key]
-                return cached_char, selected_rarity, is_lucky or is_ultra, is_pity
+            # Remove duplicates while preserving order
+            seen = set()
+            fallback_order = [r for r in fallback_order if not (r in seen or seen.add(r))]
             
-            pipeline = [
-                {'$match': {'rarity': selected_rarity.display, 'id': {'$nin': claimed_ids}}},
-                {'$sample': {'size': 1}}
-            ]
+            character = None
+            final_rarity = selected_rarity
             
-            cursor = collection.aggregate(pipeline)
-            result = await cursor.to_list(length=1)
-            
-            if not result:
-                fallback_pipeline = [
-                    {'$match': {'id': {'$nin': claimed_ids}}},
+            for rarity in fallback_order:
+                # Fixed cache key - stable per user + rarity only
+                cache_key = f"char_{user_id}_{rarity.key}"
+                
+                if cache_key in character_cache:
+                    cached_char = character_cache[cache_key]
+                    return cached_char, rarity, is_lucky or is_ultra, is_pity
+                
+                pipeline = [
+                    {'$match': {'rarity': rarity.display, 'id': {'$nin': claimed_ids}}},
                     {'$sample': {'size': 1}}
                 ]
-                cursor = collection.aggregate(fallback_pipeline)
+                
+                cursor = collection.aggregate(pipeline)
                 result = await cursor.to_list(length=1)
                 
                 if result:
-                    char_rarity = result[0].get('rarity', '')
-                    selected_rarity = CharacterManager._get_rarity_by_display(char_rarity)
+                    character = result[0]
+                    final_rarity = rarity
+                    character_cache[cache_key] = character
+                    break
             
-            if result:
-                character_cache[cache_key] = result[0]
-                return result[0], selected_rarity, is_lucky or is_ultra, is_pity
+            if character:
+                return character, final_rarity, is_lucky or is_ultra, is_pity
             
             raise CharacterNotFound("No available characters")
+        except CharacterNotFound:
+            raise
         except Exception as e:
             logger.error(f"Character fetch failed: {e}", exc_info=True)
             raise
@@ -760,12 +774,32 @@ async def daily_claim(update: Update, context: CallbackContext):
             high_tier = [RarityType.MYTHIC, RarityType.CELESTIAL, RarityType.LEGENDARY]
             target_rarity = random.choice(high_tier).display
         
-        character, rarity, is_lucky, is_pity = await CharacterManager.fetch_character(user.id, target_rarity, luck_factor)
+        try:
+            character, rarity, is_lucky, is_pity = await CharacterManager.fetch_character(user.id, target_rarity, luck_factor)
+        except CharacterNotFound:
+            await update.message.reply_text(
+                "❗ <b>No characters available right now. Please try later.</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except RetryError as e:
+            logger.error(f"Retry exhausted for user {user.id}: {e}")
+            await update.message.reply_text(
+                "❗ <b>No characters available right now. Please try later.</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except Exception as e:
+            logger.error(f"Unexpected error in fetch_character for user {user.id}: {e}", exc_info=True)
+            await update.message.reply_text(
+                "❗ <b>No characters available right now. Please try later.</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
         
         if not character:
             await update.message.reply_text(
-                "❗ <b>ɴᴏ ᴄʜᴀʀᴀᴄᴛᴇʀs ᴀᴠᴀɪʟᴀʙʟᴇ</b>\n"
-                "All characters claimed or database empty.",
+                "❗ <b>No characters available right now. Please try later.</b>",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -788,7 +822,7 @@ async def daily_claim(update: Update, context: CallbackContext):
         CacheManager.invalidate_user_cache(user.id)
         
         try:
-            card_image = await ImageProcessor.create_claim_card(character, user.first_name, new_streak, rarity)
+            card_image = await ImageProcessor.create_claim_card(character, user.first_name, user.id, new_streak, rarity)
             
             caption, keyboard = MessageBuilder.build_claim_message(user, character, new_streak, rarity, is_lucky, is_pity)
             
@@ -814,25 +848,10 @@ async def daily_claim(update: Update, context: CallbackContext):
         log_caption = MessageBuilder.build_log_message(user, character, new_streak, rarity)
         asyncio.create_task(send_log_async(context, character, log_caption))
         
-    except CharacterNotFound:
-        logger.warning(f"No characters for user {user.id}")
-        await update.message.reply_text(
-            "❗ <b>ɴᴏ ᴍᴏʀᴇ ᴄʜᴀʀᴀᴄᴛᴇʀs</b>\n"
-            "You've claimed all available characters!",
-            parse_mode=ParseMode.HTML
-        )
-    except (RetryAfter, TimedOut) as e:
-        logger.error(f"Telegram API error: {e}")
-        await update.message.reply_text(
-            "⚠️ <b>sᴇʀᴠᴇʀ ʙᴜsʏ</b>\nPlease try again.",
-            parse_mode=ParseMode.HTML
-        )
     except Exception as e:
         logger.error(f"Claim error for user {user.id}: {e}", exc_info=True)
         await update.message.reply_text(
-            f"❌ <b>ᴄʟᴀɪᴍ ғᴀɪʟᴇᴅ</b>\n"
-            f"<code>{str(e)[:100]}</code>\n\n"
-            "Contact support if this persists.",
+            "❗ <b>No characters available right now. Please try later.</b>",
             parse_mode=ParseMode.HTML
         )
 
