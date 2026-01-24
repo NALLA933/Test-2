@@ -2,11 +2,8 @@ import shivu.mongodb_patch
 import importlib
 import asyncio
 import random
-import re
 import traceback
 from html import escape
-from collections import deque
-from time import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CommandHandler, CallbackContext, MessageHandler, filters, Application
 from telegram.error import BadRequest
@@ -734,24 +731,12 @@ async def guess(update: Update, context: CallbackContext) -> None:
         LOGGER.error(f"Error in guess: {e}")
         LOGGER.error(traceback.format_exc())
 
-async def fix_my_db():
-    """Database indexes cleanup"""
-    try:
-        await collection.drop_index("id_1")
-        await collection.drop_index("characters.id_1")
-        LOGGER.info("✅ Database indexes cleaned up!")
-    except Exception as e:
-        LOGGER.info(f"ℹ️ Index clean-up not required or failed: {e}")
-
 # ==================== MAIN FUNCTION ====================
 
 async def main():
     """Main async entry point - single event loop for everything"""
     try:
-        # 1. Database cleanup
-        await fix_my_db()
-        
-        # 2. Load rarity system
+        # 1. Load rarity system
         try:
             from shivu.modules.rarity import (
                 spawn_settings_collection as ssc,
@@ -766,7 +751,7 @@ async def main():
         except Exception as e:
             LOGGER.warning(f"⚠️ Rarity system not available: {e}")
 
-        # 3. Setup backup system
+        # 2. Setup backup system
         try:
             from shivu.modules.backup import setup_backup_handlers
             setup_backup_handlers(application)
@@ -774,22 +759,22 @@ async def main():
         except Exception as e:
             LOGGER.warning(f"⚠️ Backup system not available: {e}")
 
-        # 4. Start Pyrogram client
+        # 3. Start Pyrogram client
         await shivuu.start()
         LOGGER.info("✅ Pyrogram client started")
 
-        # 5. Setup PTB handlers
+        # 4. Setup PTB handlers
         application.add_handler(CommandHandler(["grab", "g"], guess, block=False))
         application.add_handler(MessageHandler(filters.ALL, message_counter, block=False))
 
-        # 6. Initialize and start PTB application
+        # 5. Initialize and start PTB application
         await application.initialize()
         await application.start()
         await application.updater.start_polling(drop_pending_updates=True)
         
         LOGGER.info("✅ ʏᴏɪᴄʜɪ ʀᴀɴᴅɪ ʙᴏᴛ sᴛᴀʀᴛᴇᴅ")
 
-        # 7. Keep bot running
+        # 6. Keep bot running
         while True:
             await asyncio.sleep(3600)
 
