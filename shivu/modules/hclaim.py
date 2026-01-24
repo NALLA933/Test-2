@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional, Dict, Tuple, Set
 from functools import wraps
-from collections import defaultdict, deque
+from collections import defaultdict
 import asyncio
 import hashlib
 
@@ -28,24 +28,9 @@ KOLKATA_TZ = pytz.timezone('Asia/Kolkata')
 UTC_TZ = pytz.UTC
 
 class RarityType(Enum):
-    MYTHIC = ("mythic", "🏵 Mythic", 1, 10, "#FF1493")
-    CELESTIAL = ("celestial", "🎐 Celestial", 2, 9, "#9370DB")
     LEGENDARY = ("legendary", "🟡 Legendary", 5, 8, "#FFD700")
-    PREMIUM = ("premium", "🔮 Premium Edition", 8, 7, "#FF69B4")
-    NEON = ("neon", "💫 Neon", 10, 6, "#00FFFF")
-    MANGA = ("manga", "✨ Manga", 12, 5, "#FF6347")
     SPECIAL = ("special", "💮 Special Edition", 15, 5, "#FFA500")
-    COSPLAY = ("cosplay", "🎭 Cosplay", 15, 4, "#DA70D6")
     RARE = ("rare", "🟣 Rare", 20, 3, "#8A2BE2")
-    EROTIC = ("erotic", "💋 Erotic", 10, 4, "#DC143C")
-    VALENTINE = ("valentine", "💝 Valentine", 8, 5, "#FF1493")
-    HALLOWEEN = ("halloween", "🎃 Halloween", 8, 5, "#FF8C00")
-    CHRISTMAS = ("christmas", "🎄 Christmas", 8, 5, "#228B22")
-    SUMMER = ("summer", "🌤 Summer", 10, 3, "#FFD700")
-    WINTER = ("winter", "☃️ Winter", 10, 3, "#87CEEB")
-    MONSOON = ("monsoon", "☔️ Monsoon", 10, 3, "#4682B4")
-    EVENTS = ("events", "🎗 Special Events", 12, 4, "#FF4500")
-    AMV = ("amv", "🎥 AMV", 15, 3, "#4B0082")
     TINY = ("tiny", "👼 Tiny", 20, 2, "#FFB6C1")
     COMMON = ("common", "🟢 Common", 50, 1, "#32CD32")
     DEFAULT = ("default", None, 0, 0, "#808080")
@@ -73,8 +58,6 @@ class ClaimConfig:
     CLAIM_TIMEOUT: int = 35
     CACHE_TTL: int = 300
     MAX_RETRIES: int = 3
-    RATE_LIMIT_WINDOW: int = 60
-    MAX_REQUESTS_PER_WINDOW: int = 3
     BONUS_STREAK_MILESTONES: Tuple[int, ...] = (3, 5, 7, 10, 14, 21, 30)
     LUCKY_BOOST_CHANCE: float = 0.18
     PITY_SYSTEM_THRESHOLD: int = 25
@@ -86,7 +69,6 @@ CONFIG = ClaimConfig()
 
 claim_semaphore = asyncio.Semaphore(100)
 active_claims: Set[int] = set()
-rate_limit_tracker = defaultdict(lambda: deque(maxlen=CONFIG.MAX_REQUESTS_PER_WINDOW))
 character_cache = TTLCache(maxsize=1500, ttl=CONFIG.CACHE_TTL)
 user_cache = TTLCache(maxsize=7000, ttl=CONFIG.CACHE_TTL)
 image_cache = LRUCache(maxsize=CONFIG.IMAGE_CACHE_SIZE)
@@ -116,29 +98,10 @@ def to_utc(dt: datetime) -> datetime:
         dt = KOLKATA_TZ.localize(dt)
     return dt.astimezone(UTC_TZ)
 
-def rate_limit_check(user_id: int) -> bool:
-    now = datetime.now()
-    user_requests = rate_limit_tracker[user_id]
-    user_requests.append(now)
-    
-    if len(user_requests) >= CONFIG.MAX_REQUESTS_PER_WINDOW:
-        oldest = user_requests[0]
-        if (now - oldest).total_seconds() < CONFIG.RATE_LIMIT_WINDOW:
-            return False
-    return True
-
-def rate_limit(func):
+def prevent_concurrent_claims(func):
     @wraps(func)
     async def wrapper(update: Update, context: CallbackContext):
         user_id = update.effective_user.id
-        
-        if not rate_limit_check(user_id):
-            remaining = CONFIG.RATE_LIMIT_WINDOW - int((datetime.now() - rate_limit_tracker[user_id][0]).total_seconds())
-            await update.message.reply_text(
-                f"⚠️ <b>ʀᴀᴛᴇ ʟɪᴍɪᴛ</b>\nWait {remaining}s.",
-                parse_mode=ParseMode.HTML
-            )
-            return
         
         if user_id in active_claims:
             await update.message.reply_text("⚙️ <b>ᴘʀᴏᴄᴇssɪɴɢ...</b>", parse_mode=ParseMode.HTML)
@@ -192,28 +155,11 @@ class TimeFormatter:
     
     @staticmethod
     def get_seasonal_event() -> Optional[RarityType]:
-        now = get_kolkata_time()
-        month = now.month
-        seasonal_map = {
-            2: RarityType.VALENTINE,
-            10: RarityType.HALLOWEEN,
-            12: RarityType.CHRISTMAS,
-            (6, 7, 8): RarityType.SUMMER,
-            (12, 1, 2): RarityType.WINTER,
-            (7, 8, 9): RarityType.MONSOON
-        }
-        
-        for key, rarity in seasonal_map.items():
-            if isinstance(key, tuple) and month in key:
-                return rarity
-            elif month == key:
-                return rarity
         return None
     
     @staticmethod
     def get_day_bonus(day: int) -> str:
-        special_days = {0: "💙 ᴍᴏɴᴅᴀʏ", 4: "🎉 ғʀɪᴅᴀʏ", 5: "🌟 sᴀᴛᴜʀᴅᴀʏ", 6: "✨ sᴜɴᴅᴀʏ"}
-        return special_days.get(day, "")
+        return ""
 
 class CacheManager:
     @staticmethod
@@ -274,9 +220,6 @@ class LuckSystem:
     
     @staticmethod
     def _get_seasonal_bonus() -> float:
-        seasonal_event = TimeFormatter.get_seasonal_event()
-        if seasonal_event:
-            return 0.15
         return 0.0
     
     @staticmethod
@@ -451,20 +394,16 @@ class CharacterManager:
             is_pity = PitySystem.check_pity(user_id)
             is_ultra = LuckSystem.is_ultra_lucky()
             is_lucky = LuckSystem.is_lucky_boost()
-            seasonal_event = TimeFormatter.get_seasonal_event()
             
             selected_rarity = None
             
             if is_ultra:
-                selected_rarity = RarityType.MYTHIC
+                selected_rarity = RarityType.LEGENDARY
                 logger.info(f"Ultra lucky for user {user_id}")
             elif is_pity:
-                high_tier = [RarityType.MYTHIC, RarityType.CELESTIAL, RarityType.LEGENDARY]
+                high_tier = [RarityType.LEGENDARY]
                 selected_rarity = random.choice(high_tier)
                 logger.info(f"Pity triggered for user {user_id} - {selected_rarity.display}")
-            elif seasonal_event and random.random() < 0.30:
-                selected_rarity = seasonal_event
-                logger.info(f"Seasonal boost for user {user_id} - {selected_rarity.display}")
             elif target_rarity:
                 selected_rarity = CharacterManager._get_rarity_by_display(target_rarity)
             elif is_lucky:
@@ -537,8 +476,8 @@ class CharacterManager:
     @staticmethod
     def _select_rarity_lucky(luck_factor: float = 1.0) -> RarityType:
         high_tier = [
-            RarityType.MYTHIC, RarityType.CELESTIAL, RarityType.LEGENDARY,
-            RarityType.PREMIUM, RarityType.NEON, RarityType.MANGA
+            RarityType.LEGENDARY,
+            RarityType.SPECIAL
         ]
         weights = [r.weight * luck_factor * 2.5 for r in high_tier]
         total = sum(weights)
@@ -743,7 +682,7 @@ async def reset_cooldown(update: Update, context: CallbackContext):
         logger.error(f"Reset error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ <b>ᴇʀʀᴏʀ</b>\n<code>{str(e)[:100]}</code>", parse_mode=ParseMode.HTML)
 
-@rate_limit
+@prevent_concurrent_claims
 async def daily_claim(update: Update, context: CallbackContext):
     user = update.effective_user
     now = datetime.now(UTC_TZ)
@@ -753,6 +692,7 @@ async def daily_claim(update: Update, context: CallbackContext):
         last_claimed = user_data.get('last_daily_claim')
         current_streak = user_data.get('claim_streak', 0)
         
+        # 24-HOUR DAILY CLAIM CHECK - ONLY RESTRICTION
         if last_claimed:
             if last_claimed.tzinfo is None:
                 last_claimed = UTC_TZ.localize(last_claimed)
@@ -771,7 +711,7 @@ async def daily_claim(update: Update, context: CallbackContext):
         
         target_rarity = None
         if is_bonus:
-            high_tier = [RarityType.MYTHIC, RarityType.CELESTIAL, RarityType.LEGENDARY]
+            high_tier = [RarityType.LEGENDARY]
             target_rarity = random.choice(high_tier).display
         
         try:
