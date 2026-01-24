@@ -14,23 +14,82 @@ from telegram.error import BadRequest
 from shivu import db, shivuu, application, LOGGER
 from shivu.modules import ALL_MODULES
 
-# MongoDB index conflict fix - prevents crashes from duplicate index creation
+# ==================== MONGODB INDEX SAFETY PATCH ====================
 from pymongo import collection as pymongo_collection
-from pymongo.errors import OperationFailure
+from pymongo.errors import OperationFailure, DuplicateKeyError
 
-# Monkey-patch to prevent index conflicts from crashing the bot
+# Store original methods
 _orig_create_index = pymongo_collection.Collection.create_index
 
 def _safe_create_index(self, keys, **kwargs):
+    """
+    Safe create_index that prevents crashes from duplicate/conflicting index creation.
+    Handles both IndexKeySpecsConflict (code 86) and DuplicateKeyError (code 11000).
+    """
     try:
         return _orig_create_index(self, keys, **kwargs)
-    except OperationFailure as e:
-        if e.code == 86:  # IndexKeySpecsConflict
-            LOGGER.debug(f"Index already exists on {self.name}, skipping")
+    
+    except (OperationFailure, DuplicateKeyError) as e:
+        # Get error code for MongoDB errors
+        error_code = getattr(e, 'code', None)
+        
+        # Handle IndexKeySpecsConflict (86) - index already exists with different specs
+        if error_code == 86:
+            LOGGER.debug(f"IndexKeySpecsConflict: Skipping index creation on {self.name} for keys {keys}. Index already exists with different specifications.")
             return None
-        raise
+        
+        # Handle DuplicateKeyError (11000)
+        elif error_code == 11000:
+            LOGGER.debug(f"DuplicateKeyError: Skipping index creation on {self.name} for keys {keys}. Duplicate key constraint violation.")
+            return None
+        
+        # Handle generic DuplicateKeyError (without code attribute)
+        elif isinstance(e, DuplicateKeyError):
+            LOGGER.debug(f"DuplicateKeyError: Skipping index creation on {self.name} for keys {keys}. {str(e)}")
+            return None
+        
+        # Re-raise all other exceptions
+        else:
+            LOGGER.error(f"Unexpected error creating index on {self.name}: {type(e).__name__}: {str(e)}")
+            raise
 
+# Apply the monkey patch
 pymongo_collection.Collection.create_index = _safe_create_index
+
+# Patch create_indexes for bulk operations
+if hasattr(pymongo_collection.Collection, 'create_indexes'):
+    _orig_create_indexes = pymongo_collection.Collection.create_indexes
+    
+    def _safe_create_indexes(self, indexes, **kwargs):
+        try:
+            return _orig_create_indexes(self, indexes, **kwargs)
+        except (OperationFailure, DuplicateKeyError) as e:
+            error_code = getattr(e, 'code', None)
+            if error_code in [86, 11000] or isinstance(e, DuplicateKeyError):
+                LOGGER.debug(f"Suppressed create_indexes error on {self.name}")
+                # Return empty list to indicate no indexes were created
+                return []
+            raise
+    
+    pymongo_collection.Collection.create_indexes = _safe_create_indexes
+
+# Patch ensure_index for compatibility with older code
+if hasattr(pymongo_collection.Collection, 'ensure_index'):
+    _orig_ensure_index = pymongo_collection.Collection.ensure_index
+    
+    def _safe_ensure_index(self, keys, **kwargs):
+        try:
+            return _orig_ensure_index(self, keys, **kwargs)
+        except (OperationFailure, DuplicateKeyError) as e:
+            error_code = getattr(e, 'code', None)
+            if error_code in [86, 11000] or isinstance(e, DuplicateKeyError):
+                LOGGER.debug(f"Suppressed ensure_index error on {self.name}")
+                return None
+            raise
+    
+    pymongo_collection.Collection.ensure_index = _safe_ensure_index
+
+# ==================== BOT CONFIGURATION ====================
 
 # Small caps conversion function
 def to_small_caps(text):
@@ -61,16 +120,19 @@ def to_small_caps(text):
         result.append(small_caps_map.get(char, char))
     return ''.join(result)
 
+# Database collections
 collection = db['anime_characters_lol']
 user_collection = db['user_collection_lmaoooo']
 user_totals_collection = db['user_totals_lmaoooo']
 group_user_totals_collection = db['group_user_totalsssssss']
 top_global_groups_collection = db['top_global_groups']
 
+# Bot constants
 MESSAGE_FREQUENCY = 40
 DESPAWN_TIME = 180
 AMV_ALLOWED_GROUP_ID = -1003100468240
 
+# Global dictionaries for state management
 locks = {}
 message_counts = {}
 sent_characters = {}
@@ -80,6 +142,7 @@ spawn_messages = {}
 spawn_message_links = {}
 currently_spawning = {}
 
+# Rarity system variables (will be imported later)
 spawn_settings_collection = None
 group_rarity_collection = None
 get_spawn_settings = None
@@ -93,8 +156,10 @@ for module_name in ALL_MODULES:
     except Exception as e:
         LOGGER.error(f"❌ Module failed: {module_name} - {e}")
 
+# ==================== HELPER FUNCTIONS ====================
 
 async def is_character_allowed(character, chat_id=None):
+    """Check if a character can spawn in the given chat"""
     try:
         if character.get('removed', False):
             LOGGER.debug(f"Character {character.get('name')} is removed")
@@ -105,6 +170,7 @@ async def is_character_allowed(character, chat_id=None):
         
         is_video = character.get('is_video', False)
         
+        # AMV restriction
         if is_video and rarity_emoji == '🎥':
             if chat_id == AMV_ALLOWED_GROUP_ID:
                 LOGGER.info(f"✅ AMV {character.get('name')} allowed in main group")
@@ -113,6 +179,7 @@ async def is_character_allowed(character, chat_id=None):
                 LOGGER.debug(f"❌ AMV {character.get('name')} blocked in group {chat_id}")
                 return False
 
+        # Group exclusive rarity check
         if group_rarity_collection is not None and chat_id:
             try:
                 current_group_exclusive = await group_rarity_collection.find_one({
@@ -131,6 +198,7 @@ async def is_character_allowed(character, chat_id=None):
             except Exception as e:
                 LOGGER.error(f"Error checking group exclusivity: {e}")
 
+        # Global rarity settings check
         if spawn_settings_collection is not None and get_spawn_settings is not None:
             try:
                 settings = await get_spawn_settings()
@@ -149,8 +217,8 @@ async def is_character_allowed(character, chat_id=None):
         LOGGER.error(f"Error in is_character_allowed: {e}\n{traceback.format_exc()}")
         return True
 
-
 async def get_chat_message_frequency(chat_id):
+    """Get message frequency setting for a chat"""
     try:
         chat_frequency = await user_totals_collection.find_one({'chat_id': str(chat_id)})
         if chat_frequency:
@@ -165,8 +233,8 @@ async def get_chat_message_frequency(chat_id):
         LOGGER.error(f"Error in get_chat_message_frequency: {e}")
         return MESSAGE_FREQUENCY
 
-
 async def update_grab_task(user_id: int):
+    """Update grab task count for a user"""
     try:
         user = await user_collection.find_one({'id': user_id})
         if user and 'pass_data' in user:
@@ -177,8 +245,8 @@ async def update_grab_task(user_id: int):
     except Exception as e:
         LOGGER.error(f"Error in update_grab_task: {e}")
 
-
 async def despawn_character(chat_id, message_id, character, context):
+    """Remove character after timeout if not grabbed"""
     try:
         await asyncio.sleep(DESPAWN_TIME)
 
@@ -186,7 +254,7 @@ async def despawn_character(chat_id, message_id, character, context):
             last_characters.pop(chat_id, None)
             spawn_messages.pop(chat_id, None)
             spawn_message_links.pop(chat_id, None)
-            currently_spawning.pop(chat_id, None)
+            currently_spawning.pop(str(chat_id), None)
             return
 
         try:
@@ -238,14 +306,16 @@ async def despawn_character(chat_id, message_id, character, context):
         last_characters.pop(chat_id, None)
         spawn_messages.pop(chat_id, None)
         spawn_message_links.pop(chat_id, None)
-        currently_spawning.pop(chat_id, None)
+        currently_spawning.pop(str(chat_id), None)
 
     except Exception as e:
         LOGGER.error(f"Error in despawn_character: {e}")
         LOGGER.error(traceback.format_exc())
 
+# ==================== MESSAGE HANDLERS ====================
 
 async def message_counter(update: Update, context: CallbackContext) -> None:
+    """Count messages and trigger character spawns"""
     try:
         if update.effective_chat.type not in ['group', 'supergroup']:
             return
@@ -310,16 +380,17 @@ async def message_counter(update: Update, context: CallbackContext) -> None:
         LOGGER.error(f"Error in message_counter: {e}")
         LOGGER.error(traceback.format_exc())
 
-
 async def send_image(update: Update, context: CallbackContext) -> None:
+    """Spawn a character in the chat"""
     chat_id = update.effective_chat.id
+    chat_id_str = str(chat_id)
 
     try:
         all_characters = list(await collection.find({}).to_list(length=None))
 
         if not all_characters:
             LOGGER.warning(f"No characters available for spawn in chat {chat_id}")
-            currently_spawning[str(chat_id)] = False
+            currently_spawning[chat_id_str] = False
             return
 
         if chat_id not in sent_characters:
@@ -344,7 +415,7 @@ async def send_image(update: Update, context: CallbackContext) -> None:
 
         if not allowed_characters:
             LOGGER.warning(f"No allowed characters for spawn in chat {chat_id}")
-            currently_spawning[str(chat_id)] = False
+            currently_spawning[chat_id_str] = False
             return
 
         character = None
@@ -422,8 +493,7 @@ async def send_image(update: Update, context: CallbackContext) -> None:
         if chat_id in first_correct_guesses:
             del first_correct_guesses[chat_id]
 
-        # UPDATED SPAWN MESSAGE CAPTION IN HTML MODE
-        # Using &lt; and &gt; for angle brackets to prevent HTML parsing errors
+        # SPAWN MESSAGE CAPTION IN HTML MODE
         caption = """✨ ʟᴏᴏᴋ! ᴀ ᴡᴀɪꜰᴜ ʜᴀꜱ ᴀᴘᴘᴇᴀʀᴇᴅ ✨
 ✦ ᴍᴀᴋᴇ ʜᴇʀ ʏᴏᴜʀꜱ — ᴛʏᴘᴇ /ɢʀᴀʙ &lt;ᴡᴀɪꜰᴜ_ɴᴀᴍᴇ&gt;
 
@@ -437,7 +507,7 @@ async def send_image(update: Update, context: CallbackContext) -> None:
                 chat_id=chat_id,
                 video=media_url,
                 caption=caption,
-                parse_mode='HTML',  # CHANGED: Using HTML mode for stability
+                parse_mode='HTML',
                 supports_streaming=True,
                 read_timeout=300,
                 write_timeout=300,
@@ -449,7 +519,7 @@ async def send_image(update: Update, context: CallbackContext) -> None:
                 chat_id=chat_id,
                 photo=media_url,
                 caption=caption,
-                parse_mode='HTML',  # CHANGED: Using HTML mode for stability
+                parse_mode='HTML',
                 read_timeout=180,
                 write_timeout=180
             )
@@ -460,20 +530,20 @@ async def send_image(update: Update, context: CallbackContext) -> None:
         if chat_username:
             spawn_message_links[chat_id] = f"https://t.me/{chat_username}/{spawn_msg.message_id}"
         else:
-            chat_id_str = str(chat_id).replace('-100', '')
-            spawn_message_links[chat_id] = f"https://t.me/c/{chat_id_str}/{spawn_msg.message_id}"
+            chat_id_str_num = str(chat_id).replace('-100', '')
+            spawn_message_links[chat_id] = f"https://t.me/c/{chat_id_str_num}/{spawn_msg.message_id}"
 
-        currently_spawning[str(chat_id)] = False
+        currently_spawning[chat_id_str] = False
 
         asyncio.create_task(despawn_character(chat_id, spawn_msg.message_id, character, context))
 
     except Exception as e:
         LOGGER.error(f"Error in send_image: {e}")
         LOGGER.error(traceback.format_exc())
-        currently_spawning[str(chat_id)] = False
-
+        currently_spawning[chat_id_str] = False
 
 async def guess(update: Update, context: CallbackContext) -> None:
+    """Handle /grab command to claim a character"""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
@@ -623,7 +693,7 @@ async def guess(update: Update, context: CallbackContext) -> None:
             small_caps_rarity = to_small_caps(rarity)
             small_caps_owner_name = to_small_caps(owner_name)
 
-            # UPDATED SUCCESS MESSAGE WITH BOXED DESIGN AND HTML ESCAPING
+            # SUCCESS MESSAGE WITH BOXED DESIGN
             success_message = f"""🎊 ᴄᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴs! ɴᴇᴡ ᴄʜᴀʀᴀᴄᴛᴇʀ ᴜɴʟᴏᴄᴋᴇᴅ 🎊
 ╭════════•┈┈┈┈•════════╮
 ┃ ✦ ɴᴀᴍᴇ: 𓂃ࣰࣲ {escape(small_caps_character_name)}
@@ -664,7 +734,6 @@ async def guess(update: Update, context: CallbackContext) -> None:
         LOGGER.error(f"Error in guess: {e}")
         LOGGER.error(traceback.format_exc())
 
-
 async def fix_my_db():
     """Database indexes cleanup"""
     try:
@@ -674,6 +743,7 @@ async def fix_my_db():
     except Exception as e:
         LOGGER.info(f"ℹ️ Index clean-up not required or failed: {e}")
 
+# ==================== MAIN FUNCTION ====================
 
 async def main():
     """Main async entry point - single event loop for everything"""
@@ -720,7 +790,6 @@ async def main():
         LOGGER.info("✅ ʏᴏɪᴄʜɪ ʀᴀɴᴅɪ ʙᴏᴛ sᴛᴀʀᴛᴇᴅ")
 
         # 7. Keep bot running
-        # Loop ko chalta rakhne ke liye
         while True:
             await asyncio.sleep(3600)
 
@@ -738,10 +807,12 @@ async def main():
             LOGGER.error(f"Error during cleanup: {e}")
 
 if __name__ == "__main__":
-    # YE SABSE IMPORTANT FIX HAI:
-    # Purane kisi bhi loop ko khatam karke ek fresh singleton loop banana
+    # Create fresh event loop
     try:
         loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -750,3 +821,6 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         LOGGER.info("Bot stopped.")
+    except Exception as e:
+        LOGGER.error(f"Unexpected error: {e}")
+        traceback.print_exc()
