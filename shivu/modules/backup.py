@@ -12,7 +12,7 @@ LOGGER = logging.getLogger(__name__)
 BACKUP_DIR = "backups"
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
-OWNER_ID = 8453236527
+OWNER_ID = 5147822244
 scheduler = None
 
 def convert_objectid(obj):
