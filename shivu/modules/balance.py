@@ -1,3 +1,4 @@
+The error is because MongoDB stores datetime as strings. Here's the fixed version:
 import asyncio
 from datetime import datetime, timedelta
 from html import escape
@@ -35,10 +36,13 @@ async def claim_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     lst = usr.get('last_daily')
     now = datetime.utcnow()
     
-    if lst and lst.date() == now.date():
-        rem = timedelta(days=1) - (now - lst)
-        await u.message.reply_text(f"⚠️ Already claimed\nNext: {fmt_t(rem.total_seconds())}")
-        return
+    if lst:
+        if isinstance(lst, str):
+            lst = datetime.fromisoformat(lst)
+        if lst.date() == now.date():
+            rem = timedelta(days=1) - (now - lst)
+            await u.message.reply_text(f"⚠️ Already claimed\nNext: {fmt_t(rem.total_seconds())}")
+            return
     
     await bal_col.update_one({'id': uid}, {'$inc': {'balance': 2000}, '$set': {'last_daily': now}})
     await add_tx(uid, 'daily', 2000, "Daily")
@@ -56,9 +60,14 @@ async def pay_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("⚠️ Invalid recipient")
         return
     
-    if sid in pay_cd and (datetime.utcnow() - pay_cd[sid]).total_seconds() < 600:
-        await u.message.reply_text(f"⚠️ Cooldown: {fmt_t(600 - (datetime.utcnow() - pay_cd[sid]).total_seconds())}")
-        return
+    if sid in pay_cd:
+        cd_time = pay_cd[sid]
+        if isinstance(cd_time, str):
+            cd_time = datetime.fromisoformat(cd_time)
+        elapsed = (datetime.utcnow() - cd_time).total_seconds()
+        if elapsed < 600:
+            await u.message.reply_text(f"⚠️ Cooldown: {fmt_t(600 - elapsed)}")
+            return
     
     try:
         amt = int(c.args[0])
@@ -96,6 +105,8 @@ async def hist_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         amt = t.get('amount', 0)
         tp = t.get('type', 'unknown')
         ts = t.get('timestamp')
+        if ts and isinstance(ts, str):
+            ts = datetime.fromisoformat(ts)
         dt = ts.strftime('%d/%m %H:%M') if ts else 'N/A'
         msg += f"{'💰' if amt > 0 else '💸'} <code>{amt:+,}</code> • {tp}\n   {dt}\n\n"
     
