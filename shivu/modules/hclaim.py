@@ -50,6 +50,8 @@ async def daily_claim(update: Update, context: CallbackContext):
         last = user_data.get('last_daily_claim')
         
         if last:
+            if isinstance(last, str):
+                last = datetime.fromisoformat(last.replace('Z', '+00:00'))
             if last.tzinfo is None:
                 last = UTC_TZ.localize(last)
             elapsed = now - last
