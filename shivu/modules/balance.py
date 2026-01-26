@@ -1,4 +1,3 @@
-The error is because MongoDB stores datetime as strings. Here's the fixed version:
 import asyncio
 from datetime import datetime, timedelta
 from html import escape
