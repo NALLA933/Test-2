@@ -198,21 +198,4 @@ async def gstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 application.add_handler(CommandHandler("gstats", gstats, filters=filters.ALL))
 application.add_handler(CommandHandler("checkdb", check_db, filters=filters.ALL))
 application.add_handler(CommandHandler("testdb", test_db, filters=filters.ALL))
-application.add_handler(CommandHandler("dbinfo", check_db, filters=filters.ALL))  # Alias
-
-# Also add a simple ping command to check if bot is alive
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check if bot is responsive"""
-    start_time = time.time()
-    message = await update.message.reply_text("🏓 Pong!")
-    end_time = time.time()
-    latency = (end_time - start_time) * 1000  # Convert to milliseconds
-    
-    await message.edit_text(
-        f"🏓 <b>Pong!</b>\n"
-        f"📶 Latency: {latency:.0f} ms\n"
-        f"🕒 Time: {datetime.now().strftime('%H:%M:%S')}",
-        parse_mode=ParseMode.HTML
-    )
-
-application.add_handler(CommandHandler("ping", ping, filters=filters.ALL))
+application.add_handler(CommandHandler("dbinfo", check_db, filters=filters.ALL))
