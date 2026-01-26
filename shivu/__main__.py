@@ -666,13 +666,49 @@ async def guess(update: Update, context: CallbackContext) -> None:
 
 
 async def fix_my_db():
-    """Database indexes cleanup"""
+    """Database indexes cleanup and duplicate removal"""
     try:
         await collection.drop_index("id_1")
-        await collection.drop_index("characters.id_1")
-        LOGGER.info("✅ Database indexes cleaned up!")
+        LOGGER.info("✅ Dropped id_1 index")
     except Exception as e:
-        LOGGER.info(f"ℹ️ Index clean-up not required or failed: {e}")
+        LOGGER.debug(f"id_1 index doesn't exist: {e}")
+    
+    try:
+        await collection.drop_index("characters.id_1")
+        LOGGER.info("✅ Dropped characters.id_1 index")
+    except Exception as e:
+        LOGGER.debug(f"characters.id_1 index doesn't exist: {e}")
+    
+    try:
+        pipeline = [
+            {"$group": {"_id": "$id", "count": {"$sum": 1}, "docs": {"$push": "$_id"}}},
+            {"$match": {"count": {"$gt": 1}}}
+        ]
+        
+        duplicates = await collection.aggregate(pipeline).to_list(length=None)
+        
+        if duplicates:
+            LOGGER.warning(f"Found {len(duplicates)} duplicate character IDs")
+            
+            for dup in duplicates:
+                char_id = dup['_id']
+                doc_ids = dup['docs']
+                keep_first = doc_ids[0]
+                to_delete = doc_ids[1:]
+                
+                LOGGER.info(f"Removing {len(to_delete)} duplicates for character ID: {char_id}")
+                await collection.delete_many({"_id": {"$in": to_delete}})
+            
+            LOGGER.info("✅ All duplicates removed")
+        else:
+            LOGGER.info("✅ No duplicates found")
+        
+        await collection.create_index([("id", 1)], unique=True)
+        LOGGER.info("✅ Created unique index on id field")
+        
+    except Exception as e:
+        LOGGER.error(f"Error fixing database: {e}")
+        LOGGER.error(traceback.format_exc())
 
 
 async def main():
